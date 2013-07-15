@@ -1,6 +1,14 @@
 RedisApi::Application.routes.draw do
-  resources :connections
+  resources :connections, only: ['index']
 
+  get "connections/ping" => "connections#ping"
+  get "connections/info" => "connections#index"
+  get "connections/keys" => "connections#keys"
+  get "connections/mget" => "connections#mget"
+  post "connections/mset" => "connections#mset"
+
+
+ 
 
   # The priority is based upon order of creation:
   # first created -> highest priority.
