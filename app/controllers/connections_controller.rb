@@ -1,7 +1,8 @@
 class ConnectionsController < ApplicationController
   skip_before_filter  :verify_authenticity_token
+  before_filter :check_redis_connection
 
-  # detect connections
+  # detect connection to redis server
   def ping
     begin 
       @connection = $redis.ping
@@ -47,17 +48,19 @@ class ConnectionsController < ApplicationController
   # get all keys info
   def keys
     begin 
-      case params['filter']
+      @connection = case params['filter']
       when 'all'  
-        @connection = $redis.keys
+        $redis.keys
+      when 'mall'
+        $redis.keys 'mall*'   
       when 'cache'
-        @connection = $redis.keys 'mallc*'
+        $redis.keys 'mallc*'
       when 'session'
-        @connection = $redis.keys 'malls*'      
+        $redis.keys 'malls*'      
       when nil
-        @connection = $redis.keys.length
+        $redis.keys.length
       else
-        @connection = $redis.keys "#{params['filter']}*"
+        $redis.keys "#{params['filter']}*"
       end
     rescue => e
       @connection = {status: 500, message: e.message }
@@ -66,7 +69,6 @@ class ConnectionsController < ApplicationController
     respond_to do |format|
       format.json { render json: @connection }
     end 
-
   end
 
   def to_obj(value)
@@ -80,22 +82,22 @@ class ConnectionsController < ApplicationController
       success_count = 0
       failed_count = params.length   
       params.each do |key, body|
-        body = JSON.parse(body) 
-        if body['ttl'].blank? || body['ttl'].to_i == -1 
-          response = $redis.set body['key'], body['value']
+        body = eval(body) 
+        if body[:ttl].blank? || body[:ttl].to_i == -1 
+          response = $redis.set body[:key], body[:value]
         else
-          response = $redis.setex body['key'], body['ttl'].to_i, body['value']
+          response = $redis.setex body[:key], body[:ttl].to_i, body[:value]
         end
         if response == "OK"
           success_count += 1
           failed_count -= 1
         else
-          Rails.logger.error "#{body[key]}"
+          Rails.logger.error "#{body[:key]}"
         end
       end
       @connection = { status: 200, message: "OK", success_count: success_count, failed_count: failed_count }
     rescue => e
-      Rails.logger.info "[ERROR]: #{body['ttl']}"
+      Rails.logger.info "[ERROR]: #{body[:ttl]}"
       @connection = { status: 500, message: e.message, success_count: success_count, failed_count: failed_count }
     end 
 
@@ -104,13 +106,47 @@ class ConnectionsController < ApplicationController
     end
   end 
 
+  # TODO: need to add delete function. 
   # DELETE /connections/1
   # DELETE /connections/1.json
-  def destroy
-    @connection = Connection.find(params[:id])
+  #def destroy
+  #  @connection = Connection.find(params[:id])
 
-    respond_to do |format|
-      format.json { head :no_content }
+  #  respond_to do |format|
+  #    format.json { head :no_content }
+  #  end
+  #end
+
+  private
+  # for cloud setting of redis, the default connection cut time is 30s. 
+  # Therefore, we need to re-connection again to server. 
+  def check_redis_connection
+    begin
+      $redis.ping
+    rescue => e
+      Rails.logger.info "connection has break, begin to reconnection"
+      Rails.logger.info "env is #{ENV['VCAP_SERVICES']}"
+
+      # default setting
+      host = '127.0.0.1'
+      port = 6379
+      password = ''
+
+      Rails.logger.info "default redis setting host: #{host}, port: #{port}, pasword: #{password}"
+
+      if ENV['VCAP_SERVICES']
+        services = JSON.parse(ENV['VCAP_SERVICES'])
+        service_key = services.keys.select { |svc| svc =~ /redis_cluster/i }.first
+        service_credentials = services[service_key].first['credentials']
+        host = service_credentials['host']
+        port = service_credentials['port']
+        password = service_credentials['password']
+        Rails.logger.info "change to cloud setting: host: #{host}, port: #{port}, password: #{password}"
+      end
+
+      $redis=Redis.new(:host => host, :port => port)
+      $redis.auth(password) unless password.blank?
+      $redis.ping
     end
   end
 end
