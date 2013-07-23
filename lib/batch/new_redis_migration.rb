@@ -1,21 +1,24 @@
-class Batch::NewRedisMigration
-  attr_accessor :source, :destination, :keys
-  attr_accessor :failed_send_key_count, :expired_key_count, :used_key_count, :success_send_key_count
+class NewRedisMigration
+  require 'redis'
+  require 'httpclient'
 
-  def self.input
-    gets.strip.chomp
-  end
+  attr_accessor :source, :destination, 
+                  :keys, :values, :ttls, 
+                  :loop_times,
+                  :failed_send_key_count, :success_send_key_count
 
   def self.init
     p "Begin to do redis migration task.................."
     pattern_flag = true
+    # TODO: now we just can only use 2 direct redis access to api redis access
+    # do not touch other options.
     while pattern_flag
       p "Please choose migration pattern:"
       p "1. Direct redis access --> Direct redis access"
       p "2. Direct redis access --> Api redis access"
       p "3. Api redis access --> Direct redis access" 
       p "4. Api redis access --> Api redis access"
-      p "which one?"
+      print "Which one?"
       case input
       when "1"
         pattern_flag = false
@@ -30,7 +33,7 @@ class Batch::NewRedisMigration
         pattern_flag = false
         connect("ApiRedisConnection", "ApiRedisConnection")
       else
-        p "you must choose one from 1, 2, 3, 4!" 
+        p "You must choose one from 1, 2, 3, 4!" 
       end
     end
   end
@@ -45,19 +48,18 @@ class Batch::NewRedisMigration
   def self.prepare_keys
     data_flag = true
     while data_flag
-      p "Decide which kind of data need to be migrated (the default is only mall data):"
+      p "Decide which kind of data need to be migrated (the default is Only Mall Data):"
       p "1. All data"
       p "2. Only Mall data"
-      case input
+
+      case (input.presence || "2")
       when "1"
         data_flag = false
         @keys = @source.keys 
       when "2"
         data_flag = false
-        @keys = @source.keys.select { |key| /^mall*/ =~ key }
+        @keys = @source.keys.select { |key| /^mall_/ =~ key }
         choose_data_type
-      else
-        p "you must choose one from 1, 2!"
       end
     end
   end
@@ -72,14 +74,13 @@ class Batch::NewRedisMigration
       p "3. Other Data"
       case input
       when "1"
-        cache_keys = @keys.select { |key| /^mallc*/ =~ key  }
-
+        cache_keys = @keys.select { |key| /^mallc_/ =~ key  }
         data_type_flag = set_data_type_flag
       when "2"
-        session_keys = @keys.select { |key| /^malls*/ =~ key  }
+        session_keys = @keys.select { |key| /^malls_/ =~ key  }
         data_type_flag = set_data_type_flag
       when "3"
-        other_keys = @keys.delete_if { |key| /^mallc*/ =~ key || /^malls*/ =~ key }
+        other_keys = @keys.delete_if { |key| /^mall[cs]_/ =~ key }
         data_type_flag = set_data_type_flag
       end
     end
@@ -87,15 +88,39 @@ class Batch::NewRedisMigration
   end
 
   def self.set_data_type_flag
-    p "Do you want to add one more? (yn)"
+    print "Do you want to add one more? (yn)"
     input == 'n' ? false : true
   end 
 
   def self.prepare_loop_times
     p "Decide how many data need to be sent/get at one time: (the defaut is 1000)"
-    loop_times = (input).to_i
-    loop_times == 0 ? 1000 : loop_times
+    @loop_times = (input).to_i
+    @loop_times == 0 ? 1000 : @loop_times
   end
+
+  def self.save_error_to_file(*key_arr)
+    p "Begin to save unsend key to files"  
+    File.open(filepath, 'a') do |f|
+      f.puts(key_arr.to_json)
+      f.close
+    end
+  rescue => e
+    p "Can not save error to file, the reason is #{e.message}"
+  end
+
+  def self.filepath(file_name = "redis_migration_error_keys.json")
+    Rails.root.join("tmp", "#{file_name}")
+  end
+
+  def self.clear_error_log_file
+    File.delete(filepath) if File.exist? filepath
+  end
+
+  def self.init_count
+    @success_send_key_count = 0
+    @failed_send_key_count = 0
+    @loop_times = 0
+  end  
 
   def self.quit
     @source.quit
@@ -105,51 +130,47 @@ class Batch::NewRedisMigration
   def self.execute
     init
     prepare_keys
-    loop_times = prepare_loop_times
-
-    @used_key_count = 0
-    @expired_key_count = 0
-    @success_send_key_count = 0
-    @failed_send_key_count = 0
+    prepare_loop_times
+    init_count
 
     p "We need to migrate #{@keys.length} data from source redis to destination redis"
+    p "Begin to clear error log"
+    clear_error_log_file
+
     begin_time = cur_time
+
     @keys.each_slice(loop_times) do |key_arr|
-      begin 
+      begin
         body = generate_body(*key_arr)
       rescue => e
         p "we can not get redis data, error message is #{e.message}"
         @failed_send_key_count += key_arr.length
-        p "Begin to save unsend key to files"
+        save_error_to_file(key_arr)
         next 
       end
       
       begin
-        p @success_send_key_count
-        p @failed_send_key_count
         res = @destination.mset(body)
         res_message = JSON.parse(res.content)
         @success_send_key_count += res_message['success_count']
         @failed_send_key_count += res_message['failed_count']
         if res_message['status'] == 200
-          p "="*((@expired_key_count + @used_key_count)*50/@keys.length) + "#{(@expired_key_count + @used_key_count)/@keys.length.to_f}"
+          p "#{(@expired_key_count + @used_key_count)/@keys.length.to_f}"
         else
           p "we can not post redis data, error message is #{res_message}"
-          p "Begin to save unsend key to files"
+          save_error_to_file(key_arr)
           next 
         end 
       rescue => e
         p "we can not post redis data, error message is #{e}"
         @failed_send_key_count += key_arr.length
-        p "Begin to save unsend key to files"
+        save_error_to_file(key_arr)
         next 
       end 
     end
     end_time = Time.now.to_i
-    p (end_time - begin_time)/ 60.0
+    p "Totally we cost #{(end_time - begin_time)/ 60.0} to migrate redis data"
     p "total keys length: #{@keys.length}"
-    p "used keys length: #{@used_key_count}"
-    p "expired keys length: #{@expired_key_count}"
     p "success send keys length: #{@success_send_key_count}"
     p "failed send keys length: #{@failed_send_key_count}"
     quit
@@ -170,26 +191,27 @@ class Batch::NewRedisMigration
   def self.incr_used_count 
     @used_key_count += 1
   end
-
-  def self.generate_json(key, value, index)
-    ttl = @source.ttl(key)
-    redis_data = { key: key, value: value }
-    redis_data.merge!(ttl: ttl) unless no_expire_time?(ttl)
-    incr_used_count
-    { index.to_s => redis_data.to_json }
-  end 
-
+  
   def self.generate_body(*key_arr)
-    {}.tap do |body|
-      key_arr.each_with_index do |key, index|
-        value = @source.get(key)
-        has_expired?(value) ? incr_expired_count : body.merge!(generate_json(key, value, index))
-      end 
+    body = {}
+    @source.conn.pipelined do
+      @values = @source.mget(*key_arr)
+      @ttls = key_arr.map {|key| @source.ttl(key) }
     end
-  end
-
+    @ttls.each_with_index do |ttl, index|
+      body.merge!(index.to_s => { 'key' => key_arr[index], 
+                                  'ttl' => ttl.value, 
+                                  'value' => @values.value[index]})
+    end
+    body
+  end 
+  
   def self.cur_time
     Time.now.to_i
+  end
+
+  def self.input
+    gets.strip.chomp
   end
 end
 
@@ -204,26 +226,20 @@ class RedisConnection
   def input 
     gets.strip.chomp
   end 
-
-  def setting(content, default)
-    content == "" ? default : content
-  end
 end
 
 class DirectRedisConnection < RedisConnection
   def initialize
     super
-    p "Please input host (The Default is: 127.0.0.1):"
-    # in rails we can use 
-    # host = input.presence || "127.0.0.1"
-    host = setting(input, "127.0.0.1") 
-    p "Please input port (The Default is: 6379):"
-    port = setting(input, "6379").to_i
-    p "Please input password (The Default is empty):"
+    print "Please input host (The Default is: 127.0.0.1):"
+    host = input.presence || "127.0.0.1" 
+    print "Please input port (The Default is: 6379):"
+    port = (input.presence || "6379").to_i
+    print "Please input password (The Default is empty):"
     password = input
 
     @conn = Redis.new(host: host, port: port)
-    @conn.auth(password) unless password == ''
+    @conn.auth(password) unless password.blank?
     begin 
       self.ping
       p "successfully connect to #{@conn.inspect}" 
@@ -235,11 +251,15 @@ class DirectRedisConnection < RedisConnection
   end
 
   def ttl(key)
-   @conn.ttl(key)
+    @conn.ttl(key)
   end
 
   def get(key)
-   @conn.get(key)
+    @conn.get(key)
+  end
+
+  def mget(*keys)
+    @conn.mget(*keys)
   end  
 
   def keys
@@ -252,11 +272,11 @@ class DirectRedisConnection < RedisConnection
   end 
 
 #  def mset(body)
-#    @conn.post("#{@url}/connections/mset.json", body)
+#   TODO: need to add this function
 #  end
 
 #  def mget(body)
-#    @conn.get("#{@url}/connections/mget.json", body)
+#   TODO: need to add this function
 #  end
 
   def ping
@@ -272,7 +292,8 @@ class ApiRedisConnection < RedisConnection
   def initialize
     super
     p "Please input redis api url (The Default is: http://localhost:3000):"
-    @url = setting(input, "http://localhost:3000")
+    @url = input.presence || "http://localhost:3000"
+
     @conn = HTTPClient.new()
     begin 
       if self.ping.content == "PONG" 
